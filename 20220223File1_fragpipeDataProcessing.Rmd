@@ -1,0 +1,689 @@
+---
+title: "alberto mito synthesis"
+author: "Chris Hughes, Fares Burwag"
+output:
+  html_notebook:
+      code_folding: none
+---
+
+This document details the analysis of proteomics data acquired to look at protein synthesis in mitochondrial enriched fractions. 
+
+## Setting up the environment
+
+These are packages you will need for this notebook. For exact versions used, please refer to the session info at the bottom of this notebook.
+
+```{r, message = FALSE, warning=FALSE}
+##########################################################################################
+library('tidyverse')
+library('limma')
+library('DEqMS')
+library('RColorBrewer')
+library('preprocessCore')
+library('readxl')
+
+mitoCartaData <- read_excel("Human.MitoCarta3.0.xls", sheet = 2)
+```
+
+<div style="margin-bottom:50px;"></div>
+
+I want to set a base directory that we can use as a link to the directory where we will do most of the work. I use two directories here because the Workspace is what is pushed to GitHub and contains scripts and plot files, but the Repository is where more of the big data is stored that does not get pushed.
+
+```{r}
+##########################################################################################
+generalDatasets = 'C:/Users/chughes/Documents/bccrc/projectsRepository/generalDatasets'
+baseWorkspace = 'C:/Users/chughes/Documents/bccrc/projectsWorkspace/sorensenLab/relatedToOthers'
+baseRepository = '.'
+#generalDatasets = 'C:/Users/chris/OneDrive/Documents/bccrc/projectsRepository/generalDatasets'
+#baseWorkspace = 'C:/Users/chris/OneDrive/Documents/bccrc/projectsWorkspace/sorensenLab/relatedToYbx1'
+#baseRepository = 'C:/Users/chris/OneDrive/Documents/bccrc/projectsRepository/sorensenLab/relatedToYbx1'
+```
+
+<div style="margin-bottom:50px;"></div>
+
+## Data processing
+
+First we can process the psm data.
+
+```{r}
+##########################################################################################
+##this is the function we will use
+combinePsmFiles = function(filePath, ...){
+  psm = read_tsv(filePath) %>%
+    dplyr::select(Peptide, `Protein ID`, Gene, Spectrum, `Assigned Modifications`) %>%
+    dplyr::rename(sequence = Peptide, 
+                  accession = `Protein ID`,
+                  gene = Gene,
+                  scan = Spectrum,
+                  mods = `Assigned Modifications`) %>%
+    dplyr::mutate(fraction = sub('.*Mito_B[1-3]F(.*)\\.[0-9]+\\.[0-9]+\\.[0-9]+','\\1',scan)) %>%
+    dplyr::mutate(batch = sub('.*Mito_B(.*)F[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+','\\1',scan)) %>%
+    dplyr::mutate(scan = as.numeric(sub('.*Mito_B[1-3]F[0-9]+\\.(.*)\\.[0-9]+\\.[0-9]+','\\1',scan))) %>%
+    dplyr::mutate(label = ifelse(grepl('R\\(10',mods),'heavy',
+                                ifelse(grepl('K\\(237',mods),'heavy','light'))) %>%
+    dplyr::filter(!grepl('CONT', accession), !is.na(gene), !grepl('-', gene)) %>%
+    dplyr::select(scan, batch, fraction, accession, gene, sequence, label)
+  ##
+  return(psm)
+}
+
+##
+psmFiles = list.files(paste(baseRepository,'/fragpipeAnalysis',sep=''),
+                      pattern = 'psm.tsv', full.names = TRUE, recursive = TRUE)
+psmDataSet = lapply(psmFiles, combinePsmFiles)
+allPsmData = do.call('rbind', psmDataSet)
+```
+
+<div style="margin-bottom:50px;"></div>
+
+Now we can get the quant data.
+
+```{r}
+##########################################################################################
+##this is the function we will use
+combineQuantFiles = function(filePath, ...){
+  quantData = read_tsv(filePath) %>%
+    dplyr::select(MS2ScanNumber, `126Intensity`:`131CIntensity`)
+  colnames(quantData) = c('scan','tmt126C','tmt127N','tmt127C','tmt128N',
+                  'tmt128C','tmt129N','tmt129C','tmt130N','tmt130C','tmt131N','tmt131C')
+  ##
+  fraction = sub('.*_Mito_B[1-3]F(.*)\\.raw_Matrix\\.txt', '\\1', filePath)
+  batch = sub('.*_Mito_B(.*)F[0-9]+\\.raw_Matrix\\.txt', '\\1', filePath)
+  quantData$fraction = fraction
+  quantData$batch = batch
+  print(paste('Processing file for fraction ', fraction, '.', sep = ''))
+  ##
+  return(quantData)
+}
+
+##
+quantFiles = list.files(paste(baseRepository,'/quantFiles/',sep=''),
+           pattern = '_Matrix.txt', full.names = TRUE)
+quantDataSet = lapply(quantFiles, combineQuantFiles)
+allQuantData = do.call('rbind', quantDataSet)
+```
+
+<div style="margin-bottom:50px;"></div>
+
+Now combine the data.
+
+```{r}
+##########################################################################################
+combinedData = allPsmData %>%
+  left_join(allQuantData)
+##
+saveRDS(combinedData, paste(baseRepository, '/dataset_processedIdAndQuantPsmData.rds', sep=''))
+```
+
+<div style="margin-bottom:50px;"></div>
+
+Plot the peptide data across the different batches to see if any batch-to-batch normalization is needed.
+
+```{r}
+##########################################################################################
+##first I will make a sample table that has the channel annotation
+tmtBatch = tibble('batch1' = c('lightMix_1','wtN2_1','kdN2_1','wtN1_1','kdN1_1','wtF1_1','kdF1_1','wtF1_4','empty_1','kdN2_4','boost_1'),
+                  'batch2' = c('lightMix_2','wtN2_2','kdN2_2','wtN1_2','kdN1_2','wtF1_2','kdF1_2','wtN1_4','empty_2','kdN1_4','boost_2'),
+                  'batch3' = c('lightMix_3','wtN2_3','kdN2_3','wtN1_3','kdN1_3','wtF1_3','kdF1_3','wtN2_4','empty_3','kdF1_4','boost_3'))
+
+
+##now reshape the data to combine the different batches
+ptxData = readRDS(paste(baseRepository, '/dataset_processedIdAndQuantPsmData.rds', sep='')) %>%
+  dplyr::filter(label == 'heavy') %>%
+  dplyr::group_by(batch, accession, gene, sequence) %>%
+  dplyr::summarise(across(tmt126C:tmt131C, median, na.rm = TRUE)) %>%
+  tidyr::pivot_longer(cols = tmt126C:tmt131C, names_to = 'tmtLabel', values_to = 'tmtIntensity') %>%
+  tidyr::pivot_wider(names_from = c(tmtLabel, batch), values_from = tmtIntensity)
+colnames(ptxData)[4:36] = c(tmtBatch$batch1, tmtBatch$batch2, tmtBatch$batch3)
+
+
+##plot the different batches
+ptxPlot = ptxData %>%
+  pivot_longer(cols = lightMix_1:boost_3, names_to = 'tmtLabel', values_to = 'tmtIntensity') %>%
+  dplyr::mutate(tmtLabel = factor(tmtLabel, levels = colnames(ptxData)[4:36]))
+ggplot(ptxPlot, aes(tmtLabel, log10(tmtIntensity))) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+##save the result
+saveRDS(ptxData, paste(baseRepository, '/dataset_processedIdAndQuantPsmDataAllBatches.rds', sep=''))
+```
+
+<div style="margin-bottom:50px;"></div>
+
+I think this looks OK. There isn't really any systematic variability between the different batches in my opinion. Roll the data into proteins and calculate p-values using Limma.
+
+```{r}
+##########################################################################################
+##combine peptides into proteins
+pepData = readRDS(paste(baseRepository, '/dataset_processedIdAndQuantPsmDataAllBatches.rds', sep='')) %>%
+  dplyr::mutate(across(lightMix_1:boost_3, log2)) %>%
+  dplyr::group_by(accession, gene) %>%
+  dplyr::summarise(across(lightMix_1:boost_3, median, na.rm = TRUE))
+
+##process the data with limma
+#you can just change these two conditions to calculate other comparisons
+conditionOne = 'wtF1'
+conditionTwo = 'wtN1'
+limmaData = pepData %>%
+  dplyr::select(accession, gene, which(grepl(conditionOne, colnames(pepData))), which(grepl(conditionTwo, colnames(pepData))))
+
+#specify that there must be at least 3 values across the 4 replicates of each condition
+limmaDataSub1 = subset(limmaData, rowSums(is.na(limmaData[,3:6])) < 2 & rowSums(is.na(limmaData[,7:10])) < 2)
+limmaDataSub1[sapply(limmaDataSub1, is.infinite)] <- NA
+#kind of interesting there is only NA values in two of the samples, wtF1_2 and kdF1_2...these were both in batch 2. Might be worth a closer look. 
+
+#limma
+fit = lmFit(limmaDataSub1[3:10], design=c(-1,-1,-1,-1,1,1,1,1))
+fit2 = eBayes(fit)
+limmaDataSub1$log2Fc = fit2$coefficients
+limmaDataSub1$pVal = fit2$p.value
+limmaDataSub1$meanExp = rowMeans(limmaDataSub1[,3:10], na.rm = TRUE)
+
+#the p-value plot here looks odd. I guess there isn't enough changing so it has trouble fitting the model.
+#the data also appear to have a lot of noise between replicates
+ggplot(limmaDataSub1, aes(meanExp, log2Fc)) +
+  geom_point()
+
+
+##what about with DEqMS
+dat.psm.log = readRDS(paste(baseRepository, '/dataset_processedIdAndQuantPsmDataAllBatches.rds', sep='')) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(sequence, gene, which(grepl(conditionOne, colnames(.))), which(grepl(conditionTwo, colnames(.))))
+dat.psm.log = subset(dat.psm.log, rowSums(is.na(dat.psm.log[,3:6])) < 2 & rowSums(is.na(dat.psm.log[,7:10])) < 2)
+dat.psm.log[,3:10] =  log2(dat.psm.log[,3:10])
+dat.gene.nm = medianSweeping(dat.psm.log,group_col = 2)
+boxplot(dat.gene.nm,las=2,ylab="log2 ratio",main="data test")
+#no...the problem here is that you can't get it to not normalize the values when it summarizes it to proteins.
+```
+
+It looks like they just used a t-test for their original analysis, which is maybe what you have to do here. 
+
+From the original mePROD paper:
+
+Excel files were used as input for a custom made in-house Python pipeline. Python 3.6 was used together with the following packages: pandas 0.23.4 (McKinney, 2010), numpy 1.15.4 (van der Walt et al., 2011), matplotlib 3.0.1 (Hunter, 2007). Excel files with peptide data were read in and each channel was normalized to the lowest channel based on total intensity. For each peptide sequence, all possible modification states containing a heavy label were extracted and the intensities for each channel were averaged between all modified peptides. Baseline subtraction was performed by subtracting the measured intensities for the non-SILAC-labeled sample from all other values. Negative intensities were treated as zero. For relative quantification, channel values were divided by the abundance in the booster channel. The heavy label incorporation at the protein level was calculated by taking the median of all peptide sequences belonging to one unique protein accession. These values were combined with the standard protein output of PD 2.2 to add annotation data to the master protein accessions.
+
+Log2 fold changes were calculated by log2 transformation of the ratio between the mean of the replicates of treated samples versus the control samples. Significance was assessed by unpaired, two-sided Student’s t test. P values were adjusted by Benjamini-Hochberg FDR correction. Adjusted P values lower than 0.05 were considered as significant. N represents number of independent replicates. Error bars, unless stated otherwise, indicate the standard deviation of replicates. Unless stated otherwise significance was defined as adjusted P values < 0.05. Adjusted P value and fold change cutoffs were applied as indicated. For clustering and enrichment analyses (see below) q value cutoffs of 0.001 were used for significance definition. Plotting and fitting of data was performed with Origin Pro 2018. For linear regression P values were calculated with Origin and raw P-values used for statistics
+
+We can try it this way. Before I do this, I want to add some checks so we can look at pre- and post-data scaling.
+
+### FARES - Attempt to normalize
+
+```{r}
+# 
+# install.packages("bookdown")
+# install.packages("ggbeeswarm")
+# install.packages("ggridges")
+# install.packages("lmerTest")
+# install.packages("multcomp")
+# install.packages("statmod")
+# install.packages("UpSetR")
+# install.packages("writexl")
+
+# prolfqua_repoLink <- "prolfqua_1.1.2.tar.gz"
+# install.packages(prolfqua_repoLink,repos = NULL, type="source", dependencies = TRUE)
+
+library(prolfqua)
+
+```
+
+
+```{r}
+
+psmData = readRDS(paste(baseRepository, '/dataset_processedIdAndQuantPsmData.rds', sep='')) %>%
+  filter(accession %in% multiPep_psmData)
+tmtBatch = tibble('batch1' = c('lightMix_1','wtN2_1','kdN2_1','wtN1_1','kdN1_1','wtF1_1','kdF1_1','wtF1_4','kdN2_4','boostMix_1'),
+                  'batch2' = c('lightMix_2','wtN2_2','kdN2_2','wtN1_2','kdN1_2','wtF1_2','kdF1_2','wtN1_4','kdN1_4','boostMix_2'),
+                  'batch3' = c('lightMix_3','wtN2_3','kdN2_3','wtN1_3','kdN1_3','wtF1_3','kdF1_3','wtN2_4','kdF1_4','boostMix_3'))
+
+#light peptides
+exp1Light = psmData[psmData$batch == 1 & psmData$label == 'light', c(8:15,17:18)]
+colnames(exp1Light) = tmtBatch$batch1
+dim(exp1Light)
+exp2Light = psmData[psmData$batch == 2 & psmData$label == 'light', c(8:15,17:18)]
+colnames(exp2Light) = tmtBatch$batch2
+dim(exp2Light)
+exp3Light = psmData[psmData$batch == 3 & psmData$label == 'light', c(8:15,17:18)]
+colnames(exp3Light) = tmtBatch$batch3
+dim(exp3Light)
+allLight = c(colSums(exp1Light,na.rm = TRUE),colSums(exp2Light,na.rm = TRUE),colSums(exp3Light,na.rm = TRUE))
+allLightPlot = tibble('sampleName' = factor(names(allLight),levels = names(allLight)), 'totalSignal' = allLight)
+ggplot(allLightPlot, aes(sampleName, totalSignal, fill = sampleName)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'light peptide sum intensity') +
+  scale_fill_manual(values = c(rep(brewer.pal(3,'Accent'),each = 10))) +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#heavy peptides
+exp1Heavy = psmData[psmData$batch == 1 & psmData$label == 'heavy', c(8:15,17:18)]
+colnames(exp1Heavy) = tmtBatch$batch1
+dim(exp1Heavy)
+exp2Heavy = psmData[psmData$batch == 2 & psmData$label == 'heavy', c(8:15,17:18)]
+colnames(exp2Heavy) = tmtBatch$batch2
+dim(exp2Heavy)
+exp3Heavy = psmData[psmData$batch == 3 & psmData$label == 'heavy', c(8:15,17:18)]
+colnames(exp3Heavy) = tmtBatch$batch3
+dim(exp3Heavy)
+allHeavy = c(colSums(exp1Heavy,na.rm = TRUE),colSums(exp2Heavy,na.rm = TRUE),colSums(exp3Heavy,na.rm = TRUE))
+allHeavyPlot = tibble('sampleName' = factor(names(allHeavy),levels = names(allHeavy)), 'totalSignal' = allHeavy)
+ggplot(allHeavyPlot, aes(sampleName, totalSignal, fill = sampleName)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'heavy peptide sum intensity') +
+  scale_fill_manual(values = c(rep(brewer.pal(3,'Accent'),each = 10))) +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#all peptides
+exp1 = psmData[psmData$batch == 1, c(8:15,17:18)]
+colnames(exp1) = tmtBatch$batch1
+dim(exp1)
+exp2 = psmData[psmData$batch == 2, c(8:15,17:18)]
+colnames(exp2) = tmtBatch$batch2
+dim(exp2)
+exp3 = psmData[psmData$batch == 3, c(8:15,17:18)]
+colnames(exp3) = tmtBatch$batch3
+dim(exp3)
+allPeps = c(colSums(exp1,na.rm = TRUE),colSums(exp2,na.rm = TRUE),colSums(exp3,na.rm = TRUE))
+allPepsPlot = tibble('sampleName' = factor(names(allPeps),levels = names(allPeps)), 'totalSignal' = allPeps)
+ggplot(allPepsPlot, aes(sampleName, totalSignal, fill = sampleName)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'total peptide sum intensity') +
+  scale_fill_manual(values = c(rep(brewer.pal(3,'Accent'),each = 10))) +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+
+```{r}
+# psmData2 <- psmData
+# 
+# psmData2[psmData2$batch == "1",grepl("tmt",colnames(psmData2))] <- normalize.quantiles(psmData2[psmData2$batch == "1",grepl("tmt",colnames(psmData2))] %>% as.matrix())
+# 
+# psmData2[psmData2$batch == "2",grepl("tmt",colnames(psmData2))] <- normalize.quantiles(psmData2[psmData2$batch == "2",grepl("tmt",colnames(psmData2))] %>% as.matrix())
+# 
+# psmData2[psmData2$batch == "3",grepl("tmt",colnames(psmData2))] <- normalize.quantiles(psmData2[psmData2$batch == "3",grepl("tmt",colnames(psmData2))] %>% as.matrix())
+
+psmData = readRDS(paste(baseRepository, '/dataset_processedIdAndQuantPsmData.rds', sep='')) %>%
+  filter(accession %in% multiPep_psmData)
+
+psmData2 <- psmData
+#batch 1
+exp1Raw = psmData2[psmData2$batch == 1, c(8:15,17:18)]
+target = min(colSums(exp1Raw, na.rm = TRUE))
+target
+normFacs = target / colSums(exp1Raw, na.rm = TRUE)
+exp1Sl = sweep(exp1Raw, 2, normFacs, FUN = "*")
+
+#batch 2
+exp2Raw = psmData2[psmData2$batch == 2, c(8:15,17:18)]
+target = min(colSums(exp2Raw, na.rm = TRUE))
+target
+normFacs = target / colSums(exp2Raw, na.rm = TRUE)
+exp2Sl = sweep(exp2Raw, 2, normFacs, FUN = "*")
+
+#batch 3
+exp3Raw = psmData2[psmData2$batch == 3, c(8:15,17:18)]
+target = min(colSums(exp3Raw, na.rm = TRUE))
+target
+normFacs = target / colSums(exp3Raw, na.rm = TRUE)
+exp3Sl = sweep(exp3Raw, 2, normFacs, FUN = "*")
+
+#combine
+allExp = rbind(exp1Sl, exp2Sl, exp3Sl)
+psmData2[,c(8:15,17:18)] = allExp
+
+
+```
+
+
+
+```{r}
+
+
+#quality check, light
+lightExp1 = psmData2[psmData2$batch == 1 & psmData2$label == 'light', c(8:15,17:18)]
+lightExp2 = psmData2[psmData2$batch == 2 & psmData2$label == 'light', c(8:15,17:18)]
+lightExp3 = psmData2[psmData2$batch == 3 & psmData2$label == 'light', c(8:15,17:18)]
+allLightNA = c(apply(lightExp1,2,function(x){sum(x == 0, na.rm = TRUE)}),
+               apply(lightExp2,2,function(x){sum(x == 0, na.rm = TRUE)}),
+               apply(lightExp3,2,function(x){sum(x == 0, na.rm = TRUE)}))
+names(allLightNA) = c(tmtBatch$batch1, tmtBatch$batch2, tmtBatch$batch3)
+allLight = c(colSums(lightExp1,na.rm = TRUE),colSums(lightExp2,na.rm = TRUE),colSums(lightExp3,na.rm = TRUE))
+names(allLight) = c(tmtBatch$batch1, tmtBatch$batch2, tmtBatch$batch3)
+allLightPlot = tibble('sampleName' = factor(names(allLight),levels = names(allLight)), 'totalSignal' = allLight)
+ggplot(allLightPlot, aes(sampleName, totalSignal, fill = sampleName)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'light peptide sum intensity') +
+  scale_fill_manual(values = c(rep(brewer.pal(3,'Accent'),each = 10))) +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#quality check, heavy
+heavyExp1 = psmData2[psmData2$batch == 1 & psmData2$label == 'heavy', c(8:15,17:18)]
+heavyExp2 = psmData2[psmData2$batch == 2 & psmData2$label == 'heavy', c(8:15,17:18)]
+heavyExp3 = psmData2[psmData2$batch == 3 & psmData2$label == 'heavy', c(8:15,17:18)]
+allHeavy = c(colSums(heavyExp1,na.rm = TRUE),colSums(heavyExp2,na.rm = TRUE),colSums(heavyExp3,na.rm = TRUE))
+names(allHeavy) = c(tmtBatch$batch1, tmtBatch$batch2, tmtBatch$batch3)
+allHeavyPlot = tibble('sampleName' = factor(names(allHeavy),levels = names(allHeavy)), 'totalSignal' = allHeavy)
+ggplot(allHeavyPlot, aes(sampleName, totalSignal, fill = sampleName)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'heavy peptide sum intensity') +
+  scale_fill_manual(values = c(rep(brewer.pal(3,'Accent'),each = 10))) +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#quality check, total
+allExp1 = psmData2[psmData2$batch == 1, c(8:15,17:18)]
+allExp2 = psmData2[psmData2$batch == 2, c(8:15,17:18)]
+allExp3 = psmData2[psmData2$batch == 3, c(8:15,17:18)]
+allPeps = c(colSums(allExp1,na.rm = TRUE),colSums(allExp2,na.rm = TRUE),colSums(allExp3,na.rm = TRUE))
+names(allPeps) = c(tmtBatch$batch1, tmtBatch$batch2, tmtBatch$batch3)
+allPepsPlot = tibble('sampleName' = factor(names(allPeps),levels = names(allPeps)), 'totalSignal' = allPeps)
+ggplot(allPepsPlot, aes(sampleName, totalSignal, fill = sampleName)) +
+  geom_bar(stat = 'identity') +
+  labs(title = 'total peptide sum intensity') +
+  scale_fill_manual(values = c(rep(brewer.pal(3,'Accent'),each = 10))) +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r}
+
+pepData = psmData2 %>%
+  dplyr::filter(grepl('heavy', label)) %>%
+  dplyr::group_by(batch,accession,gene,sequence) %>%
+  dplyr::summarise(across(tmt126C:tmt131C, median, na.rm = TRUE))
+
+
+#subtract the tmt126C (light SILAC) channel from the others and change negative values to 0
+pepDataBaseline = apply(pepData[,c(6:12,14)], 2, function(x) x - pepData$tmt126C)
+pepDataBaseline[pepDataBaseline < 0] = 0
+
+#recombine
+pepDataFinal = pepData
+pepDataFinal[,c(6:12,14)] = pepDataBaseline
+
+
+```
+
+
+
+```{r}
+
+#divide by the booster channel
+boosterScale = apply(pepDataFinal[,c(6:12,14)], 2, function(x) x / pepDataFinal$tmt131C)
+pepDataBooster = pepDataFinal
+pepDataBooster[,c(6:12,14)] = boosterScale
+
+#roll up into proteins
+proData = pepDataBooster %>%
+  dplyr::select(-tmt126C, -tmt130C, -tmt131C) %>%
+  dplyr::group_by(batch, accession, gene) %>%
+  dplyr::summarise(across(tmt127N:tmt131N, median, na.rm = TRUE))
+  
+proData2 <- proData
+
+proData2[proData2$batch == "1",grepl("tmt",colnames(proData2))] <- normalize.quantiles(proData2[proData2$batch == "1",grepl("tmt",colnames(proData2))] %>% as.matrix())
+
+proData2[proData2$batch == "2",grepl("tmt",colnames(proData2))] <- normalize.quantiles(proData2[proData2$batch == "2",grepl("tmt",colnames(proData2))] %>% as.matrix())
+
+proData2[proData2$batch == "3",grepl("tmt",colnames(proData2))] <- normalize.quantiles(proData2[proData2$batch == "3",grepl("tmt",colnames(proData2))] %>% as.matrix())
+
+
+#reshape the data into the different batches
+tmtBatch = tibble('batch1' = c('wtN2_1','kdN2_1','wtN1_1','kdN1_1','wtF1_1','kdF1_1','wtF1_4','kdN2_4'),
+                  'batch2' = c('wtN2_2','kdN2_2','wtN1_2','kdN1_2','wtF1_2','kdF1_2','wtN1_4','kdN1_4'),
+                  'batch3' = c('wtN2_3','kdN2_3','wtN1_3','kdN1_3','wtF1_3','kdF1_3','wtN2_4','kdF1_4'))
+
+##now reshape the data to combine the different batches
+proBatches = proData2 %>%
+  tidyr::pivot_longer(cols = tmt127N:tmt131N, names_to = 'tmtLabel', values_to = 'tmtIntensity') %>%
+  tidyr::pivot_wider(names_from = c(tmtLabel, batch), values_from = tmtIntensity)
+colnames(proBatches)[3:26] = c(tmtBatch$batch1, tmtBatch$batch2, tmtBatch$batch3)
+
+
+##plot the different batches
+ptxPlot = proBatches %>%
+  pivot_longer(cols = wtN2_1:kdF1_4, names_to = 'tmtLabel', values_to = 'tmtIntensity') %>%
+  dplyr::mutate(tmtLabel = factor(tmtLabel, levels = colnames(proBatches)[3:26]))
+ggplot(ptxPlot, aes(tmtLabel, log10(tmtIntensity))) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+
+
+```{r}
+##########################################################################################
+##the code below could be modified to give you a t-test
+conditionOne = 'wtF1'
+conditionTwo = 'kdF1'
+testData = proBatches %>%
+  dplyr::select(accession, gene, which(grepl(conditionOne, colnames(proBatches))), which(grepl(conditionTwo, colnames(proBatches))))
+# testData[testData == 0] = NA
+testData[,c(3:ncol(testData))] <- apply(testData[,c(3:ncol(testData))], 2,
+                                        function(x) replace(as.numeric(x),
+                                                            which(x == 0),
+                                                            sample(x[x<quantile(x[!is.na(x) & x > 0], 0.01,na.rm = T,names = F) & !is.na(x) & x > 0],sum(x == 0,na.rm = T),replace = T)))
+testDataSub = subset(testData, rowSums(is.na(testData[3:6]))<3 & rowSums(is.na(testData[7:10]))<3)
+
+pvalSet = apply(testDataSub, 1, function(x) t.test(as.numeric(x[c(3:6)]), as.numeric(x[c(7:10)]))$p.value)
+logFcSet = log2(rowMeans(testDataSub[,c(3:6)],na.rm = TRUE) / rowMeans(testDataSub[,c(7:10)],na.rm = TRUE))
+testResults = tibble(gene = testDataSub$gene,
+                    logFc = logFcSet,
+                    pValue = pvalSet, 
+                    pValueAdj = p.adjust(pvalSet, method = "BH")) 
+#
+ggplot(testResults, aes(logFc, -log10(pValue))) +
+  geom_point()
+
+## Storing a couple of cases. Lets test out contrasts: wtF1:wtN2, kdF1:kdN2, wtF1:kdF1, wtN2:kdN2
+tTest_results <- list()
+
+for (conditionCont in c("wtF1:wtN2", "kdF1:kdN2", "wtF1:kdF1", "wtN2:kdN2")){
+  
+  conditionOne = str_match(conditionCont, "^(.*):")[,2]
+  conditionTwo = str_match(conditionCont, ":(.*)$")[,2]
+  testData = proBatches %>%
+    dplyr::select(accession, gene, which(grepl(conditionOne, colnames(proBatches))), which(grepl(conditionTwo, colnames(proBatches))))
+  # testData[testData == 0] = NA
+  testData[,c(3:ncol(testData))] <- apply(testData[,c(3:ncol(testData))], 2,
+                                          function(x) replace(as.numeric(x),
+                                                              which(x == 0),
+                                                              sample(x[x<quantile(x[!is.na(x) & x > 0], 0.01,na.rm = T,names = F) & !is.na(x) & x > 0],sum(x == 0,na.rm = T),replace = T)))
+  testDataSub = subset(testData, rowSums(is.na(testData[3:6]))<3 & rowSums(is.na(testData[7:10]))<3)
+  
+  pvalSet = apply(testDataSub, 1, function(x) t.test(as.numeric(x[c(3:6)]), as.numeric(x[c(7:10)]))$p.value)
+  logFcSet = log2(rowMeans(testDataSub[,c(3:6)],na.rm = TRUE) / rowMeans(testDataSub[,c(7:10)],na.rm = TRUE))
+  testResults = tibble(gene = testDataSub$gene,
+                      logFc = logFcSet,
+                      pValue = pvalSet, 
+                      pValueAdj = p.adjust(pvalSet, method = "BH"))
+  testResults['contrast'] <- gsub(":","-",conditionCont)
+  tTest_results <- bind_rows(tTest_results, testResults)
+}
+
+```
+
+
+
+```{r}
+
+# Lets try LIMMA again...
+limmaData <- proBatches
+
+# applying minProb to values of 0.000000 (these are values that appeared in one of the TMT channels but not in this particular sample)
+limmaData[,c(3:ncol(limmaData))] <- apply(limmaData[,c(3:ncol(limmaData))], 2,
+                                        function(x) replace(as.numeric(x),
+                                                            which(x == 0),
+                                                            sample(x[x<quantile(x[!is.na(x) & x > 0], 0.01,na.rm = T,names = F) & !is.na(x) & x > 0],sum(x == 0,na.rm = T),replace = T)))
+limmaDataOrdered <- limmaData[,order(colnames(limmaData))]
+limmaDataSub = subset(limmaDataOrdered, rowSums(is.na(limmaData[3:6]))<2 & rowSums(is.na(limmaData[7:10]))<2 & rowSums(is.na(limmaData[11:14]))<2 & rowSums(is.na(limmaData[15:18]))<2 & rowSums(is.na(limmaData[19:22]))<2 & rowSums(is.na(limmaData[23:26]))<2)
+
+design_categories <- str_match(colnames(limmaDataSub[,c(3:ncol(limmaDataSub))]), "....")
+design <- model.matrix(~ 0 + design_categories)
+colnames(design) <- gsub("design_categories", "", colnames(design))
+
+categories <- c("wtF1", "wtN1", "wtN2", "kdF1", "kdN1", "kdN2")
+category_contrasts <- c()
+category_contrasts <- combn(categories, 2) %>% apply(2, function(x){
+  append(category_contrasts, paste0(x[[1]], "-", x[[2]]))
+})
+
+limmaContrasts <- makeContrasts(contrasts = category_contrasts, levels = design)
+limmaMatrix <- limmaDataSub[3:26] %>% as.matrix()
+row.names(limmaMatrix) <- limmaDataSub$gene 
+
+limmaFit <- lmFit(limmaMatrix, design) %>%
+  contrasts.fit(limmaContrasts) %>%
+  eBayes()
+
+limmaTest_results <- c()
+## Storing a couple of cases. Lets test out contrasts: wtF1:wtN2, kdF1:kdN2, wtF1:kdF1, wtN2:kdN2
+for (conditionCont in c("wtF1:wtN2", "kdF1:kdN2", "wtF1:kdF1", "wtN2:kdN2")){
+  contrastResults <- topTable(limmaFit, coef = gsub(":", "-", conditionCont), number = 2000)
+  contrastResults["contrast"] <- gsub(":", "-", conditionCont)
+  limmaTest_results <- bind_rows(limmaTest_results, contrastResults)
+}
+
+```
+
+
+```{r}
+
+# Evaluating both methods
+
+nrow(tTest_results)
+nrow(limmaTest_results)
+# Overall, there are more rows using tTest, but that's expected given genes are excluded based on presence across two conditions (as opposed to across all 6 conditions).
+
+tTest_sigSummary <- tTest_results %>% 
+  filter(pValue <= 0.05) %>%
+  group_by(contrast) %>%
+  summarise(sig_hits = n())
+limmaTest_sigSummary <- limmaTest_results %>% 
+  filter(P.Value <= 0.05) %>%
+  group_by(contrast) %>%
+  summarise(sig_hits = n())
+compare_sigSummary <- tibble(contrast = tTest_sigSummary$contrast,
+                             tTest_hits = tTest_sigSummary$sig_hits,
+                             limmaTest_hits = limmaTest_sigSummary$sig_hits)
+# Overall, limma seems to outperform pairwise t-tests in detecting significant hits despite more stringent prevalence filtering constraints.
+
+```
+
+
+```{r}
+## Things to explore
+
+# Intersection and exclusion of genes upregulated/downregulated in WT vs KD when exposed to nutrient deprivation
+vennData <- decideTests(limmaFit,adjust.method = "none")
+vennDiagram(vennData[,c("wtF1-wtN1","kdF1-kdN1")],mar = c(0,0,0,0),include = "up")
+vennDiagram(vennData[,c("wtF1-wtN1","kdF1-kdN1")],mar = c(0,0,0,0), include = "down")
+
+vennDiagram(vennData[,c("wtF1-wtN2","kdF1-kdN2")],mar = c(0,0,0,0),include = "up")
+vennDiagram(vennData[,c("wtF1-wtN2","kdF1-kdN2")],mar = c(0,0,0,0), include = "down")
+
+```
+
+
+```{r}
+library(fgsea)
+
+## Getting all unique mitochondrial 'path' names from mtioCarta. These are the gene set names.
+mitoPathNames <- mitoCartaData %>%
+  separate(MitoCarta3.0_MitoPathways, sep = "\\|", into = c("path1","path2","path3","path4","path5","path6")) %>%
+  select(path1:path6) %>%
+  apply(2, function (x) {str_match(x,"([A-Za-z][A-Za-z\\s]*) >[A-Za-z\\ \\-]*$")[,1]}) %>%
+  c()
+mitoPathNames <- unique(mitoPathNames[!is.na(mitoPathNames)])
+
+## Developing a dictionary where each term is mapped to annotated mitochondrial proteins.
+term_dictionary <- list()
+for (term in mitoPathNames){
+  loop_row <- filter(mitoCartaData, grepl(term, MitoCarta3.0_MitoPathways))
+  term_dictionary <- append(term_dictionary, setNames(list(loop_row$Symbol), gsub(" ", "", gsub(">","_",term))))
+}
+
+## Write geneset (.gmt file)
+fgsea::writeGmtPathways(term_dictionary, "mitoPathways.gmt")
+mitoGeneset <- fgsea::gmtPathways("mitoPathways.gmt")
+
+## To reduce p-value inflation and ask more targeted questions, filter for pathways of interest (out of 200+)
+targetGeneset <- mitoGeneset[grepl("import", names(mitoGeneset), ignore.case = T)]
+
+## Calculate protein ranks/score for a contrast of interest
+rank_points <- topTable(limmaFit, coef = gsub(":", "-", "wtF1-wtN2"), number = 2000) %>%
+  filter(P.Value <= 0.05, ID %in% mitoCartaData$Symbol) %>%
+  mutate(stat = -log10(P.Value) * logFC) %>%
+  select(ID, stat) %>%
+  deframe()%>%
+  na.omit()
+
+kdF1kdN2_gsea <- fgsea(targetGeneset, rank_points)
+kdF1kdN2_gsea
+
+
+```
+
+
+
+```{r}
+
+# Difference in total heavy signal intensity when normalized to light signal intensity at the peptide level
+
+psmSumIntensity <- psmData %>%
+  group_by(batch, gene, label) %>%
+  summarize(across(tmt126C:tmt131C,sum, na.rm = TRUE))
+
+psmIntensityRatios <- psmSumIntensity %>%
+  pivot_wider(names_from = label,values_from = tmt126C:tmt131C)
+psmIntensityRatios <- bind_cols(psmIntensityRatios[,c(1,2)],psmIntensityRatios[,seq(3,24,2)]/psmIntensityRatios[,seq(4,24,2)])
+colnames(psmIntensityRatios)[c(3:13)] <- gsub("heavy","HL_ratio",colnames(psmIntensityRatios[,-c(1,2)]))
+psmIntRatioLabelled <- psmIntensityRatios  %>%
+  select(-c(tmt126C_HL_ratio,tmt130C_HL_ratio,tmt131N_HL_ratio)) %>%
+  pivot_longer(cols = tmt127N_HL_ratio:tmt131C_HL_ratio, names_to = 'tmtLabel', values_to = 'tmtRatio') %>%
+  pivot_wider(names_from = c(tmtLabel, batch), values_from = tmtRatio)
+colnames(psmIntRatioLabelled)[2:25] = c(tmtBatch$batch1, tmtBatch$batch2, tmtBatch$batch3)
+
+ratioData <- psmIntRatioLabelled[,order(colnames(psmIntRatioLabelled))] %>%
+  pivot_longer(2:25, names_to = "sample", values_to = "tmtHtoL_ratio") %>%
+  mutate(sample = str_match(sample,"^....")) %>%
+  filter(gene %in% mitoCartaData$Symbol)
+
+ggplot(ratioData, aes(x = sample, y = tmtHtoL_ratio))+
+  geom_boxplot()+
+  lims(y = c(0, 0.2))
+
+```
+
+
+```{r}
+
+mtGenes <- mitoCartaData$UniProt[mitoCartaData$hg19_Chromosome == "chrM"]
+nuGenes <- mitoCartaData$UniProt[mitoCartaData$hg19_Chromosome != "chrM" & mitoCartaData$hg19_Chromosome != "NA"]
+
+proBatches %>%
+  mutate(dnaSource = case_when(accession %in% mtGenes ~ "mitochondrialDNA",
+                               accession %in% nuGenes ~ "nuclearDNA",
+                               TRUE ~ NA)) %>%
+  group_by(dnaSource) %>%
+  summarize(across(wtN2_1:kdF1_4, median, na.rm = TRUE))
+
+## Seems like none of the mitochondrially-encoded genes have been detected.
+
+```
+
+
+
+
